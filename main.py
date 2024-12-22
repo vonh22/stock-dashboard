@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -5,7 +6,48 @@ import plotly.graph_objects as go
 from datetime import datetime
 import requests
 import json
+from openai import OpenAI
+from dotenv import load_dotenv
+import tiktoken
+import hashlib
+import json
+from functools import lru_cache
 
+
+load_dotenv() 
+
+
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """Count the number of tokens in a text string."""
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+def create_cache_key(company_data: dict) -> str:
+    """Create a unique cache key from company data."""
+    serialized = json.dumps(company_data, sort_keys=True)
+    return hashlib.md5(serialized.encode()).hexdigest()
+
+@lru_cache(maxsize=100)
+def get_cached_analysis(cache_key: str) -> str:
+    """Retrieve cached analysis if available."""
+    return st.session_state.get(f'analysis_cache_{cache_key}')
+
+def cache_analysis(cache_key: str, analysis: str) -> None:
+    """Cache the analysis result."""
+    st.session_state[f'analysis_cache_{cache_key}'] = analysis
+
+def optimize_company_data(company_data: dict) -> dict:
+    """Optimize company data by removing unnecessary information and summarizing long text."""
+    optimized = company_data.copy()
+    
+    # Truncate company overview if it's too long
+    if len(company_data['overview']) > 500:
+        optimized['overview'] = company_data['overview'][:500] + "..."
+    
+    # Remove any None or 'N/A' values
+    optimized = {k: v for k, v in optimized.items() if v not in (None, 'N/A')}
+    
+    return optimized
 
 def get_stock_data(ticker_symbol):
     """
@@ -209,107 +251,90 @@ def display_company_financials(stock):
 
 
 
-def get_ai_analysis(company_data):
+def get_ai_analysis(company_data: dict) -> str:
     """
-    Get AI analysis from local Llama model via Ollama with streaming response
+    Get AI analysis from OpenAI's GPT-4 model with optimization
     """
-    url = "http://localhost:11434/api/generate"
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     
-    # Prepare the prompt for company analysis
-    prompt = f"""You are a financial expert analyst. Analyze this company data and provide insights:
-
-Company Overview:
-{company_data['overview']}
-
-Key Financial Metrics:
-- Market Cap: {company_data['marketCap']}
-- P/E Ratio: {company_data['peRatio']}
-- Revenue Growth: {company_data['revenueGrowth']}
-- Profit Margins: {company_data['profitMargins']}
-
-Provide a detailed analysis covering:
-1. Company's market position and competitive advantages
-2. Financial health assessment
-3. Growth prospects and potential risks
-4. Investment recommendation with supporting rationale
-
-Format the analysis in clear sections with bullet points for key takeaways.
-"""
-
-    data = {
-        "model": "llama3.2",
-        "prompt": prompt,
-        "stream": True
-    }
+    # Optimize input data
+    optimized_data = optimize_company_data(company_data)
     
+    # Check cache first
+    cache_key = create_cache_key(optimized_data)
+    cached_result = get_cached_analysis(cache_key)
+    if cached_result:
+        return cached_result
+    
+    # Prepare the optimized prompt
+    prompt = f"""Analyze this company data concisely:
+
+Overview: {optimized_data['overview']}
+
+Metrics:
+- Market Cap: {optimized_data['marketCap']}
+- P/E: {optimized_data['peRatio']}
+- Revenue Growth: {optimized_data['revenueGrowth']}
+- Margins: {optimized_data['profitMargins']}
+
+Provide:
+1. Market position
+2. Financial health
+3. Growth outlook
+4. Investment recommendation
+
+Use bullet points."""
+
     try:
-        with st.spinner('Analyzing company data... This may take a few minutes as the AI model processes the information.'):
-            # Increased timeout significantly: 30s for connection, 5 minutes for reading
-            response = requests.post(
-                url, 
-                json=data, 
-                timeout=(30, 300),  # (connection timeout, read timeout)
-                stream=True,
-                headers={'Content-Type': 'application/json'}
+        with st.spinner('Analyzing company data...'):
+            # Determine model based on complexity
+            tokens = count_tokens(prompt)
+            model = "gpt-4" if tokens < 1500 else "gpt-3.5-turbo"
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a concise financial analyst."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.7,
+                stream=True
             )
             
-            if response.status_code == 200:
-                full_response = ""
-                response_placeholder = st.empty()
-                progress_bar = st.progress(0)
+            full_response = ""
+            response_placeholder = st.empty()
+            
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    full_response += content
+                    response_placeholder.markdown(full_response)
+            
+            # Cache the result
+            cache_analysis(cache_key, full_response)
+            return full_response
                 
-                # Add an initial message
-                response_placeholder.markdown("Generating analysis... You'll see the response appear here in real-time.")
-                
-                for i, line in enumerate(response.iter_lines()):
-                    if line:
-                        json_response = json.loads(line)
-                        chunk = json_response.get('response', '')
-                        full_response += chunk
-                        
-                        # Update progress and response in place
-                        progress = min(1.0, (i + 1) / 50)  # Adjust denominator based on typical response length
-                        progress_bar.progress(progress)
-                        response_placeholder.markdown(full_response)
-                
-                # Clear progress bar after completion
-                progress_bar.empty()
-                return full_response
-            else:
-                st.error(f"Error: {response.status_code} - {response.text}")
-                return None
-                
-    except requests.exceptions.Timeout:
-        st.error("⚠️ Request timed out. Please ensure Ollama is running and try again.")
-        st.info("Tip: Check if the Ollama service is running on your Mac")
-        return None
-    except requests.exceptions.ConnectionError:
-        st.error("⚠️ Could not connect to Ollama server")
-        st.info("""
-        Please check:
-        1. Is Ollama running on your Mac?
-        2. Is it running on port 11434?
-        3. Try running 'ollama serve' in your terminal
-        """)
-        return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"⚠️ Network error: {str(e)}")
-        st.info("Please check your network connection and try again")
-        return None
     except Exception as e:
-        st.error(f"⚠️ Unexpected error: {str(e)}")
-        st.info("If this persists, try restarting Ollama")
+        st.error(f"⚠️ Error during OpenAI API call: {str(e)}")
+        if "api_key" in str(e).lower():
+            st.warning("Please check your OpenAI API key in the .env file")
         return None
 
 def display_ai_analysis(stock):
     """
-    Display AI analysis of the company with improved UI feedback
+    Display AI analysis of the company
     """
     st.write("### AI-Powered Company Analysis")
     
-    # Initialize session state for analysis history if not exists
+    # Initialize session state for analysis history
     if 'analysis_history' not in st.session_state:
         st.session_state.analysis_history = []
+    
+    # Check for OpenAI API key
+    if not os.getenv('OPENAI_API_KEY'):
+        st.error("OpenAI API key not found in .env file")
+        st.stop()
     
     # Prepare company data for analysis
     info = stock.info
@@ -328,7 +353,6 @@ def display_ai_analysis(stock):
             analysis = get_ai_analysis(company_data)
             
             if analysis:
-                # Add timestamp to analysis
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 st.session_state.analysis_history.append({
                     'timestamp': timestamp,
@@ -336,8 +360,10 @@ def display_ai_analysis(stock):
                 })
     
     with col2:
-        if st.button("Clear History", help="Clear all previous analyses"):
+        if st.button("Clear History"):
             st.session_state.analysis_history = []
+            # Clear cache
+            get_cached_analysis.cache_clear()
             st.rerun()
     
     # Display analysis history
@@ -346,9 +372,8 @@ def display_ai_analysis(stock):
             with st.expander(f"Analysis {len(st.session_state.analysis_history) - idx} - {analysis['timestamp']}", expanded=(idx == 0)):
                 st.markdown(analysis['content'])
                 
-                # Download button for each analysis
                 st.download_button(
-                    label="Download This Analysis",
+                    label="Download Analysis",
                     data=analysis['content'],
                     file_name=f"company_analysis_{analysis['timestamp']}.txt",
                     mime="text/plain",
@@ -356,6 +381,8 @@ def display_ai_analysis(stock):
                 )
     else:
         st.info("Click 'Generate New Analysis' to get AI-powered insights about this company.")
+
+        
 
 def main():
     st.set_page_config(page_title="Stock Analysis Dashboard", layout="wide")
